@@ -1,0 +1,239 @@
+name: Cloud Linux Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_hours:
+        description: 'Duration in hours (1-5)'
+        required: false
+        default: '4'
+      os_type:
+        description: 'OS Distribution (ubuntu / debian)'
+        required: false
+        default: 'ubuntu'
+      pat_token:
+        description: 'GitHub PAT Token'
+        required: false
+        default: ''
+      preinstall_apps:
+        description: 'Comma-separated apps: chrome, git, 7zip, python'
+        required: false
+        default: 'chrome'
+      custom_password:
+        description: 'RDP Login Password'
+        required: false
+        default: 'FastTransfer2026!'
+
+permissions:
+  contents: write
+  statuses: write
+  actions: read
+
+jobs:
+  run-linux-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Desktop Environment & XRDP
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            lxde lxde-core openbox pcmanfm lxpanel lxterminal xrdp xorgxrdp dbus-x11 chromium-browser git p7zip-full
+
+          # Configure XRDP for LXDE
+          echo '#!/bin/sh' | sudo tee /etc/xrdp/startwm.sh > /dev/null
+          echo 'if [ -r /etc/default/locale ]; then . /etc/default/locale; export LANG LANGUAGE; fi' | sudo tee -a /etc/xrdp/startwm.sh > /dev/null
+          echo 'unset SESSION_MANAGER' | sudo tee -a /etc/xrdp/startwm.sh > /dev/null
+          echo 'unset DBUS_SESSION_BUS_ADDRESS' | sudo tee -a /etc/xrdp/startwm.sh > /dev/null
+          echo 'unset XDG_RUNTIME_DIR' | sudo tee -a /etc/xrdp/startwm.sh > /dev/null
+          echo 'exec dbus-run-session -- startlxde' | sudo tee -a /etc/xrdp/startwm.sh > /dev/null
+          sudo chmod +x /etc/xrdp/startwm.sh
+
+          # Optimize XRDP server for high-speed low-bandwidth streaming (16-bit color, compression)
+          sudo sed -i 's/^crypt_level=.*/crypt_level=low/' /etc/xrdp/xrdp.ini || true
+          sudo sed -i 's/^max_bpp=.*/max_bpp=16/' /etc/xrdp/xrdp.ini || true
+          sudo sed -i 's/^use_compression=.*/use_compression=yes/' /etc/xrdp/xrdp.ini || true
+
+          # Prevent Colord / Polkit authorization popup from blocking screen
+          sudo mkdir -p /etc/polkit-1/localauthority/50-local.d/
+          echo '[Allow Colord]' | sudo tee /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla > /dev/null
+          echo 'Identity=unix-user:*' | sudo tee -a /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla > /dev/null
+          echo 'Action=org.freedesktop.color-manager.*' | sudo tee -a /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla > /dev/null
+          echo 'ResultAny=yes' | sudo tee -a /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla > /dev/null
+          echo 'ResultInactive=yes' | sudo tee -a /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla > /dev/null
+          echo 'ResultActive=yes' | sudo tee -a /etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla > /dev/null
+
+          sudo adduser xrdp ssl-cert || true
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+
+      - name: Create Cloud User
+        env:
+          INPUT_CUSTOM_PASSWORD: ${{ github.event.inputs.custom_password }}
+        run: |
+          PASS="${INPUT_CUSTOM_PASSWORD:-FastTransfer2026!}"
+          sudo id -u CloudUser &>/dev/null || sudo useradd -m -s /bin/bash CloudUser
+          echo "CloudUser:$PASS" | sudo chpasswd
+          echo "runner:$PASS" | sudo chpasswd
+          sudo usermod -aG sudo CloudUser
+          sudo adduser CloudUser ssl-cert || true
+          sudo adduser runner ssl-cert || true
+
+          # User session with clean LXDE startup
+          for UDIR in /home/CloudUser /home/runner /etc/skel; do
+            sudo mkdir -p $UDIR
+            echo '#!/bin/sh' | sudo tee $UDIR/.xsession > /dev/null
+            echo 'unset SESSION_MANAGER' | sudo tee -a $UDIR/.xsession > /dev/null
+            echo 'unset DBUS_SESSION_BUS_ADDRESS' | sudo tee -a $UDIR/.xsession > /dev/null
+            echo 'unset XDG_RUNTIME_DIR' | sudo tee -a $UDIR/.xsession > /dev/null
+            echo 'exec dbus-run-session -- startlxde' | sudo tee -a $UDIR/.xsession > /dev/null
+            sudo chmod +x $UDIR/.xsession
+            sudo cp $UDIR/.xsession $UDIR/.xsessionrc || true
+          done
+
+          # Prepare desktop shortcuts
+          for UDIR in /home/CloudUser /home/runner; do
+            sudo mkdir -p $UDIR/Desktop
+            echo '#!/bin/bash' | sudo tee $UDIR/Desktop/Welcome.sh > /dev/null
+            echo 'echo "=================================================="' | sudo tee -a $UDIR/Desktop/Welcome.sh > /dev/null
+            echo 'echo "     WELCOME TO YOUR FREE CLOUD LINUX RDP!        "' | sudo tee -a $UDIR/Desktop/Welcome.sh > /dev/null
+            echo 'echo "=================================================="' | sudo tee -a $UDIR/Desktop/Welcome.sh > /dev/null
+            sudo chmod +x $UDIR/Desktop/Welcome.sh
+
+            echo '[Desktop Entry]' | sudo tee $UDIR/Desktop/Chromium.desktop > /dev/null
+            echo 'Version=1.0' | sudo tee -a $UDIR/Desktop/Chromium.desktop > /dev/null
+            echo 'Type=Application' | sudo tee -a $UDIR/Desktop/Chromium.desktop > /dev/null
+            echo 'Name=Chromium Web Browser' | sudo tee -a $UDIR/Desktop/Chromium.desktop > /dev/null
+            echo 'Exec=chromium-browser --no-sandbox' | sudo tee -a $UDIR/Desktop/Chromium.desktop > /dev/null
+            echo 'Icon=chromium-browser' | sudo tee -a $UDIR/Desktop/Chromium.desktop > /dev/null
+            echo 'Terminal=false' | sudo tee -a $UDIR/Desktop/Chromium.desktop > /dev/null
+            sudo chmod +x $UDIR/Desktop/Chromium.desktop
+          done
+
+          sudo chown -R CloudUser:CloudUser /home/CloudUser
+          sudo chown -R runner:runner /home/runner
+
+
+      - name: Start Bore RDP Tunnel & Maintain Session
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PAT_TOKEN: ${{ github.event.inputs.pat_token }}
+          INPUT_DURATION_HOURS: ${{ github.event.inputs.duration_hours }}
+          INPUT_OS_TYPE: ${{ github.event.inputs.os_type }}
+          INPUT_CUSTOM_PASSWORD: ${{ github.event.inputs.custom_password }}
+        run: |
+          wget -q https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz
+          chmod +x bore
+
+          echo "Starting Bore TCP tunnel to bore.pub on port 3389..."
+          RDP_PORT=""
+          ASSIGNED_PORT=""
+
+          # Multi-target retry logic: try bore.pub and raw IP with retries
+          for target in "bore.pub" "159.223.110.159" "bore.pub"; do
+            echo "Attempting Bore tunnel connection to $target..."
+            for attempt in 1 2 3; do
+              rm -f bore_out.log bore_err.log
+              ./bore local 3389 --to "$target" > bore_out.log 2> bore_err.log &
+              BORE_PID=$!
+
+              for i in {1..12}; do
+                sleep 1
+                if grep -Eq "listening at [^ ]+:[0-9]+" bore_out.log; then
+                  RAW_ADDR=$(grep -Eo "listening at [^ ]+:[0-9]+" bore_out.log | head -n 1 | awk '{print $3}')
+                  RDP_PORT=$(echo "$RAW_ADDR" | sed 's/159.223.110.159/bore.pub/')
+                  ASSIGNED_PORT=$(echo "$RDP_PORT" | cut -d':' -f2)
+                  break 3
+                fi
+              done
+
+              echo "Attempt $attempt on $target not ready yet. Retrying..."
+              kill -9 $BORE_PID 2>/dev/null || true
+              sleep 2
+            done
+          done
+
+          if [ -z "$RDP_PORT" ]; then
+            echo "Failed to get bore tunnel port after all attempts. Error log:"
+            cat bore_err.log
+            exit 1
+          fi
+
+          PASS="${INPUT_CUSTOM_PASSWORD:-FastTransfer2026!}"
+
+          echo ""
+          echo "=========================================================="
+          echo "       LINUX RDP (XRDP) IS READY TO CONNECT!              "
+          echo "=========================================================="
+          echo "  RDP Address : $RDP_PORT"
+          echo "  Username    : CloudUser"
+          echo "  Password    : $PASS"
+          echo "=========================================================="
+
+          # Output connection file
+          cat << EOF > rdp_connection.json
+          {
+            "address": "$RDP_PORT",
+            "username": "CloudUser",
+            "password": "$PASS",
+            "run_id": "$GITHUB_RUN_ID",
+            "os": "linux"
+          }
+          EOF
+
+          # Post commit statuses for instant discovery
+          TOKEN="${INPUT_PAT_TOKEN:-$GITHUB_TOKEN}"
+          curl -s -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -d "{\"state\":\"success\",\"context\":\"RDP-RUN-$GITHUB_RUN_ID\",\"description\":\"$RDP_PORT\",\"target_url\":\"http://$RDP_PORT\"}" > /dev/null
+
+          curl -s -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -d "{\"state\":\"success\",\"context\":\"RDP-ENDPOINT\",\"description\":\"$RDP_PORT\",\"target_url\":\"http://$RDP_PORT\"}" > /dev/null
+
+          echo "Published instant commit status: $RDP_PORT"
+
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            echo "## 🚀 Linux Cloud RDP is Online!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+            echo "| :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+            echo "| **OS** | Linux (${INPUT_OS_TYPE:-Ubuntu/Debian}) |" >> $GITHUB_STEP_SUMMARY
+            echo "| **RDP Address** | \`$RDP_PORT\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Username** | \`CloudUser\` |" >> $GITHUB_STEP_SUMMARY
+            echo "| **Password** | \`$PASS\` |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Maintain session loop
+          DUR_HOURS="${INPUT_DURATION_HOURS:-4}"
+          TOTAL_SECONDS=$((DUR_HOURS * 3600))
+          echo "Linux RDP active! Keeping session alive for $DUR_HOURS hours ($TOTAL_SECONDS seconds)..."
+
+          ELAPSED=0
+          while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
+            if ! kill -0 $BORE_PID 2>/dev/null; then
+              echo "Bore tunnel exited. Restarting tunnel on port $ASSIGNED_PORT..."
+              if [ -n "$ASSIGNED_PORT" ]; then
+                ./bore local 3389 --to bore.pub --port "$ASSIGNED_PORT" > bore_out.log 2> bore_err.log &
+              else
+                ./bore local 3389 --to bore.pub > bore_out.log 2> bore_err.log &
+              fi
+              BORE_PID=$!
+            fi
+            sleep 15
+            ELAPSED=$((ELAPSED + 15))
+          done
