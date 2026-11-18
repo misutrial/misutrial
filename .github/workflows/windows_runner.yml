@@ -1,0 +1,256 @@
+name: Free Cloud RDP Windows Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_hours:
+        description: 'Duration in hours (1-5)'
+        required: false
+        default: '4'
+      os_type:
+        description: 'OS Distribution (windows)'
+        required: false
+        default: 'windows'
+      pat_token:
+        description: 'GitHub PAT Token'
+        required: false
+        default: ''
+      preinstall_apps:
+        description: 'Comma-separated apps: chrome, vscode, git, 7zip, telegram'
+        required: false
+        default: 'chrome'
+      custom_password:
+        description: 'RDP Login Password'
+        required: false
+        default: 'FastTransfer2026!'
+
+permissions:
+  contents: write
+  statuses: write
+  actions: read
+
+jobs:
+  run-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path "requirements.txt") {
+            pip install -r requirements.txt
+          } else {
+            pip install requests
+          }
+
+      - name: Enable Windows Remote Desktop (RDP)
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "SecurityLayer" -value 1
+          Restart-Service termservice -Force -ErrorAction SilentlyContinue
+
+      - name: Create Cloud User
+        run: |
+          $rawPass = "${{ github.event.inputs.custom_password }}"
+          if (-not $rawPass) { $rawPass = "FastTransfer2026!" }
+          Write-Host "::add-mask::$rawPass"
+          $Password = ConvertTo-SecureString $rawPass -AsPlainText -Force
+          New-LocalUser -Name "CloudUser" -Password $Password -FullName "Cloud User" -Description "RDP User"
+          Add-LocalGroupMember -Group "Administrators" -Member "CloudUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "CloudUser"
+
+      - name: Optimize Windows for Ultra-Fast RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 1 -ErrorAction SilentlyContinue
+          New-Item -Path "HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services" -Force -ErrorAction SilentlyContinue | Out-Null
+          Set-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services" -Name "MaxMonitors" -Value 1 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows NT\Terminal Services" -Name "SelectTransport" -Value 1 -Force -ErrorAction SilentlyContinue
+
+      - name: Start RDP Tunnel & Maintain Session
+        id: tunnel
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PAT_TOKEN: ${{ github.event.inputs.pat_token }}
+          INPUT_DURATION_HOURS: ${{ github.event.inputs.duration_hours }}
+          INPUT_CUSTOM_PASSWORD: ${{ github.event.inputs.custom_password }}
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip" -OutFile "bore.zip"
+          Expand-Archive -Path "bore.zip" -DestinationPath "bore"
+
+          Write-Host "Starting Bore TCP tunnel to bore.pub on port 3389 in background..."
+          $rdp = $null
+          $assignedPort = $null
+          $targets = @("bore.pub", "159.223.110.159", "bore.pub")
+
+          :targetLoop foreach ($target in $targets) {
+            Write-Host "Attempting Bore tunnel with target: $target..."
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              if (Test-Path "bore_out.log") { Remove-Item "bore_out.log" -Force -ErrorAction SilentlyContinue }
+              $process = Start-Process -FilePath ".\bore\bore.exe" -ArgumentList "local 3389 --to $target" -RedirectStandardOutput "bore_out.log" -RedirectStandardError "bore_err.log" -PassThru
+              for ($i = 0; $i -lt 12; $i++) {
+                Start-Sleep -Seconds 1
+                if (Test-Path "bore_out.log") {
+                  $log = Get-Content "bore_out.log" -Raw
+                  if ($log -match "listening at ([^\s:]+:\d+)") {
+                    $raw = $matches[1]
+                    $rdp = $raw -replace "159\.223\.110\.159", "bore.pub"
+                    $assignedPort = ($rdp -split ":")[1]
+                    break targetLoop
+                  }
+                }
+              }
+              Write-Host "Attempt $attempt on $target timed out. Retrying..."
+              Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 2
+            }
+          }
+
+          if (-not $rdp) {
+            Write-Error "Failed to obtain public Bore tunnel endpoint after all attempts."
+            exit 1
+          }
+
+          $rdpPass = if ($env:INPUT_CUSTOM_PASSWORD) { $env:INPUT_CUSTOM_PASSWORD } else { "FastTransfer2026!" }
+          Write-Host "::add-mask::$rdpPass"
+
+          Write-Host ""
+          Write-Host "==========================================================" -ForegroundColor Green
+          Write-Host "       WINDOWS RDP IS READY TO CONNECT!                   " -ForegroundColor Green
+          Write-Host "==========================================================" -ForegroundColor Green
+          Write-Host "  RDP Address : $rdp" -ForegroundColor Yellow
+          Write-Host "  Username    : CloudUser" -ForegroundColor Yellow
+          Write-Host "  Password    : ******** (Configured in Client UI)" -ForegroundColor Yellow
+          Write-Host "==========================================================" -ForegroundColor Green
+
+          # Output connection file locally
+          @{
+            address = $rdp
+            username = "CloudUser"
+            password = $rdpPass
+            run_id = $env:GITHUB_RUN_ID
+          } | ConvertTo-Json | Set-Content -Path "rdp_connection.json"
+
+          # 1. Post Commit Status INSTANTLY so desktop client discovers RDP within seconds
+          try {
+            $effectiveToken = if ($env:INPUT_PAT_TOKEN) { $env:INPUT_PAT_TOKEN } else { $env:GITHUB_TOKEN }
+            $headers = @{
+              Authorization = "Bearer $effectiveToken"
+              Accept = "application/vnd.github.v3+json"
+            }
+            
+            $statusBody = @{
+              state = "success"
+              context = "RDP-RUN-$($env:GITHUB_RUN_ID)"
+              description = $rdp
+              target_url = "http://$rdp"
+            } | ConvertTo-Json
+            Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Method Post -Headers $headers -Body $statusBody -ContentType "application/json"
+            
+            $statusBody2 = @{
+              state = "success"
+              context = "RDP-ENDPOINT"
+              description = $rdp
+              target_url = "http://$rdp"
+            } | ConvertTo-Json
+            Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/statuses/$env:GITHUB_SHA" -Method Post -Headers $headers -Body $statusBody2 -ContentType "application/json"
+            Write-Host "Published instant commit status: $rdp"
+          } catch {
+            Write-Host "Commit status notification note: $_"
+          }
+
+          if ($env:GITHUB_STEP_SUMMARY) {
+            "## 🚀 Windows Cloud RDP is Online!`n`n| Property | Value |`n| :--- | :--- |`n| **RDP Address** | ``$rdp`` |`n| **Username** | ``CloudUser`` |`n| **Status** | Active & Listening (Password in Client UI) |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          }
+
+          # 2. Launch Software Stack Installation in Background (Zero Wait for RDP Client)
+          $reqApps = "${{ github.event.inputs.preinstall_apps }}"
+          if (-not $reqApps) { $reqApps = "chrome" }
+          $apps = $reqApps.ToLower().Split(',') | ForEach-Object { $_.Trim() }
+
+          Start-Job -ScriptBlock {
+            param($apps, $reqApps)
+            $desktop = "C:\Users\CloudUser\Desktop"
+            New-Item -ItemType Directory -Force -Path $desktop | Out-Null
+
+            # Welcome Launcher
+            $batLines = @(
+              "@echo off",
+              "title Free Cloud RDP System",
+              "cls",
+              "echo ==============================================================",
+              "echo           WELCOME TO YOUR FREE CLOUD RDP!                      ",
+              "echo ==============================================================",
+              "echo  - High-Speed Gigabit Cloud Connection Active",
+              "echo  - Windows Server 2022 Datacenter",
+              "echo  - Pre-installed Stack: $reqApps",
+              "echo ==============================================================",
+              "echo.",
+              "pause"
+            )
+            Set-Content -Path "$desktop\Welcome_To_Cloud_RDP.bat" -Value $batLines
+
+            # 1. Google Chrome
+            if ($apps -contains "chrome" -or $apps -contains "all") {
+              try {
+                $installer = "$env:TEMP\chrome_installer.exe"
+                Invoke-WebRequest "https://dl.google.com/chrome/install/latest/chrome_installer.exe" -OutFile $installer
+                Start-Process $installer -ArgumentList "/silent /install" -Wait
+              } catch {}
+            }
+
+            # 2. 7-Zip
+            if ($apps -contains "7zip" -or $apps -contains "all") {
+              try {
+                $sevenZip = "$env:TEMP\7z_installer.exe"
+                Invoke-WebRequest "https://www.7-zip.org/a/7z2301-x64.exe" -OutFile $sevenZip
+                Start-Process $sevenZip -ArgumentList "/S" -Wait
+              } catch {}
+            }
+
+            # 3. Visual Studio Code (Fast Direct Offline Installer, No Winget Index Hang)
+            if ($apps -contains "vscode" -or $apps -contains "all") {
+              try {
+                $vscodeInstaller = "$env:TEMP\vscode_setup.exe"
+                Invoke-WebRequest "https://update.code.visualstudio.com/latest/win32-x64-user/stable" -OutFile $vscodeInstaller
+                Start-Process $vscodeInstaller -ArgumentList "/verysilent /mergetasks=!runcode" -Wait
+              } catch {}
+            }
+
+            # 4. Telegram Desktop
+            if ($apps -contains "telegram" -or $apps -contains "all") {
+              try {
+                $tg = "$env:TEMP\tsetup.exe"
+                Invoke-WebRequest "https://telegram.org/dl/desktop/win64" -OutFile $tg
+                Start-Process $tg -ArgumentList "/VERYSILENT /NORESTART" -Wait
+              } catch {}
+            }
+          } -ArgumentList $apps, $reqApps | Out-Null
+          Write-Host "Software stack installer dispatched asynchronously in background."
+
+          # 3. Maintain active session loop for duration
+          $durHours = [int]($env:INPUT_DURATION_HOURS)
+          if ($durHours -lt 1) { $durHours = 4 }
+          $totalSeconds = $durHours * 3600
+          Write-Host "Session active! Keeping alive for $durHours hours ($totalSeconds seconds)..."
+
+          $elapsed = 0
+          while ($elapsed -lt $totalSeconds) {
+            if ($process.HasExited) {
+              Write-Host "Bore tunnel exited. Restarting tunnel..."
+              $process = Start-Process -FilePath ".\bore\bore.exe" -ArgumentList "local 3389 --to bore.pub" -RedirectStandardOutput "bore_out.log" -RedirectStandardError "bore_err.log" -PassThru
+            }
+            Start-Sleep -Seconds 15
+            $elapsed += 15
+          }
+
